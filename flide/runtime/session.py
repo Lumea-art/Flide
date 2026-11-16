@@ -21,6 +21,8 @@ from collections import OrderedDict
 
 
 BLOCK = 64
+ADMIT_ROOM = 0.9     # of the budget a request may fill before new prefixes need a second sighting
+SEEN_MAX = 1 << 16   # mark keys remembered for that second sighting, then forgotten wholesale
 
 
 def _bytes(x) -> int:
@@ -105,6 +107,7 @@ class SessionCache:
         self._next = 0
         self.hits = self.misses = self.saved_tokens = 0
         self.evictions = self.replaced = 0
+        self.seen: set = set()
 
     def mark(self, n_prefix: int, start: int = 0) -> int | None:
         """Where to save the state of a prefix of n tokens that starts computing at `start`: the last stride multiple
@@ -153,9 +156,25 @@ class SessionCache:
 
     def insert(self, entry: Entry, parent: Entry | None = None) -> None:
         """Keep `entry`, evicting the least recently used ones it needs room from; `parent`, the entry the request
-        that saved it resumed from, goes first when `entry` covers its tokens."""
+        that saved it resumed from, goes first when `entry` covers its tokens.
+
+        While the cache has room under `ADMIT_ROOM` of its budget every prefix is kept, as before. Once it is
+        fuller, a prefix is kept only when one of its marks was saved before -- the same text up to that position
+        has been seen -- or when it extends a cached entry. A request that appears once therefore cannot evict one
+        that keeps coming back."""
         if entry.bytes > self.budget or not entry.states:
             return
+        hashes = _Hashes(entry.tokens)
+        keys = [(pos, hashes.key(pos)) for pos in entry.states]
+        roomy = self.used + entry.bytes <= ADMIT_ROOM * self.budget
+        if not roomy and parent is None and not any(k in self.seen for k in keys):
+            self.seen.update(keys)
+            if len(self.seen) > SEEN_MAX:
+                self.seen.clear()
+            return
+        self.seen.update(keys)
+        if len(self.seen) > SEEN_MAX:
+            self.seen.clear()
         if parent is not None and len(parent.tokens) <= len(entry.tokens) \
                 and entry.tokens[:len(parent.tokens)] == parent.tokens:
             eid = next((k for k, e in self.entries.items() if e is parent), None)
